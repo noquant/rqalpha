@@ -32,6 +32,8 @@ from rqalpha.utils import unwrapper, INST_TYPE_IN_STOCK_ACCOUNT
 from rqalpha.utils.i18n import gettext as _
 from rqalpha.utils.exception import patch_system_exc, EXC_EXT_NAME
 
+import os
+disable_rule_check = os.getenv('DISABLE_ARGUMENTS_CHECKER', False)
 
 main_contract_warning_flag = True
 index_contract_warning_flag = True
@@ -441,6 +443,9 @@ def apply_rules(*rules):
 
         api_rule_check_wrapper._rq_api_args_checker = checker
         api_rule_check_wrapper._rq_exception_checked = True
+        # disable in user environ ?
+        if disable_rule_check in ('YES', 'Yes', 'yes', 'TRUE', 'True', 'true'):
+            return func
         return api_rule_check_wrapper
 
     return decorator
