@@ -26,7 +26,7 @@ from typing import Dict, Optional, List, Tuple, Union, Iterable
 
 import numpy as np
 import pandas as pd
-from rqrisk import Risk, WEEKLY
+from rqrisk import Risk, WEEKLY, MONTHLY
 
 from rqalpha.const import EXIT_CODE, DEFAULT_ACCOUNT_TYPE, INSTRUMENT_TYPE, POSITION_DIRECTION
 from rqalpha.core.events import EVENT
@@ -36,7 +36,8 @@ from rqalpha.utils import INST_TYPE_IN_STOCK_ACCOUNT
 from rqalpha.utils.logger import user_system_log
 from rqalpha.const import DAYS_CNT
 from rqalpha.api import export_as_api
-
+from .plot.consts import DefaultPlot, PLOT_TEMPLATE
+from .plot.utils import max_ddd as _max_ddd
 from .plot_store import PlotStore
 
 
@@ -61,6 +62,7 @@ class AnalyserMod(AbstractMod):
         self._total_benchmark_portfolios = []
         self._sub_accounts = defaultdict(list)
         self._positions = defaultdict(list)
+        self._daily_pnl = []
 
         self._benchmark_daily_returns = []
         self._portfolio_daily_returns = []
@@ -79,6 +81,7 @@ class AnalyserMod(AbstractMod):
             'positions': self._positions,
             'orders': self._orders,
             'trades': self._trades,
+            'daily_pnl': self._daily_pnl,
         }).encode('utf-8')
 
     def set_state(self, state):
@@ -91,13 +94,14 @@ class AnalyserMod(AbstractMod):
         self._positions = value["positions"]
         self._orders = value['orders']
         self._trades = value["trades"]
+        self._daily_pnl = value.get("daily_pnl", [])
 
     def start_up(self, env, mod_config):
         self._env = env
         self._mod_config = mod_config
         self._enabled = (
             mod_config.record or mod_config.plot or mod_config.output_file or
-            mod_config.plot_save_file or mod_config.report_save_path or mod_config.bechmark
+            mod_config.plot_save_file or mod_config.report_save_path or mod_config.benchmark
         )
         if self._enabled:
             env.event_bus.add_listener(EVENT.POST_SYSTEM_INIT, self._subscribe_events)
@@ -128,7 +132,14 @@ class AnalyserMod(AbstractMod):
             weights += benchmark[1]
         return sum([daily[0] * daily[1] / weights for daily in daily_return_list])
 
-    def _subscribe_events(self, _):
+    def _subscribe_events(self, event):
+        if self._benchmark:
+            for order_book_id, weight in self._benchmark:
+                if self._env.data_proxy.instrument(order_book_id) is None:
+                    raise RuntimeError(
+                        _("benchmark not exists, please entry correct order_book_id").format(order_book_id)
+                    )
+
         self._env.event_bus.add_listener(EVENT.TRADE, self._collect_trade)
         self._env.event_bus.add_listener(EVENT.ORDER_CREATION_PASS, self._collect_order)
         self._env.event_bus.add_listener(EVENT.POST_SETTLEMENT, self._collect_daily)
@@ -150,6 +161,7 @@ class AnalyserMod(AbstractMod):
             "date": date,
             "unit_net_value": (np.array(self._benchmark_daily_returns) + 1).prod()
         })
+        self._daily_pnl.append(portfolio.daily_pnl)
 
         for account_type, account in self._env.portfolio.accounts.items():
             self._sub_accounts[account_type].append(self._to_account_record(date, account))
@@ -305,6 +317,7 @@ class AnalyserMod(AbstractMod):
                 summary["benchmark_symbol"] = self._env.data_proxy.instrument(benchmark_obid).symbol
             else:
                 summary["benchmark"] = ",".join(f"{o}:{w}" for o, w in self._benchmark)
+                summary["benchmark_symbol"] = ",".join(f"{self._env.data_proxy.instrument(o).symbol}:{w}" for o, w in self._benchmark)
 
         risk_free_rate = data_proxy.get_risk_free_rate(self._env.config.base.start_date, self._env.config.base.end_date)
         risk = Risk(
@@ -320,13 +333,24 @@ class AnalyserMod(AbstractMod):
             'tracking_error': risk.annual_tracking_error,
             'sortino': risk.sortino,
             'volatility': risk.annual_volatility,
-            'excess_volatility': risk.excess_volatility,
-            'excess_annual_volatility': risk.excess_annual_volatility,
+            'excess_volatility': risk.excess_annual_volatility,
             'max_drawdown': risk.max_drawdown,
-            'excess_max_drawdown': risk.excess_max_drawdown,
-            'excess_returns': risk.excess_return_rate,
-            'excess_annual_returns': risk.excess_annual_return,
+            'excess_max_drawdown': risk.geometric_excess_drawdown,
+            'excess_returns': risk.geometric_excess_return,
+            'excess_annual_returns': risk.geometric_excess_annual_return,
             'var': risk.var,
+            "win_rate": risk.win_rate,
+            "excess_win_rate": risk.excess_win_rate,
+            "excess_cum_returns": risk.arithmetic_excess_return,
+        })
+
+        # 盈亏比
+        daily_pnl = np.array(self._daily_pnl)
+        profit, loss = daily_pnl[daily_pnl > 0], daily_pnl[daily_pnl < 0]
+        profit, loss = profit.mean() if len(profit) else 0, loss.mean() if len(loss) else 0
+
+        summary.update({
+            "profit_loss_rate": np.abs(profit / loss) if loss else np.nan
         })
 
         summary.update({
@@ -345,9 +369,6 @@ class AnalyserMod(AbstractMod):
             benchmark_annualized_returns = (benchmark_total_returns + 1) ** (DAYS_CNT.TRADING_DAYS_A_YEAR / date_count) - 1
             summary['benchmark_annualized_returns'] = benchmark_annualized_returns
 
-            # 新增一个超额累计收益
-            summary['excess_cum_returns'] = summary["total_returns"] - summary["benchmark_total_returns"]
-
         trades = pd.DataFrame(self._trades)
         if 'datetime' in trades.columns:
             trades = trades.set_index(pd.DatetimeIndex(trades['datetime']))
@@ -355,8 +376,21 @@ class AnalyserMod(AbstractMod):
         df = pd.DataFrame(self._total_portfolios)
         df['date'] = pd.to_datetime(df['date'])
         total_portfolios = df.set_index('date').sort_index()
-        weekly_nav = df.resample("W", on="date").last().set_index("date").unit_net_value.dropna()
+        df.index = df['date']
+        weekly_nav = df.resample("W").last().set_index("date").unit_net_value.dropna()
+        monthly_nav = df.resample("M").last().set_index("date").unit_net_value.dropna()
         weekly_returns = (weekly_nav / weekly_nav.shift(1).fillna(1)).fillna(0) - 1
+        monthly_returns = (monthly_nav / monthly_nav.shift(1).fillna(1)).fillna(0) - 1
+
+        # 最长回撤持续期
+        max_ddd = _max_ddd(total_portfolios.unit_net_value.values, total_portfolios.index)
+        summary["max_drawdown_duration"] = max_ddd
+        summary.update({
+            "max_drawdown_duration_start_date": str(max_ddd.start_date),
+            "max_drawdown_duration_end_date": str(max_ddd.end_date),
+            "max_drawdown_duration_days": (max_ddd.end_date - max_ddd.start_date).days,
+        })
+
         result_dict = {
             'summary': summary,
             'trades': trades,
@@ -380,21 +414,52 @@ class AnalyserMod(AbstractMod):
             df = pd.DataFrame(self._total_benchmark_portfolios)
             df['date'] = pd.to_datetime(df['date'])
             benchmark_portfolios = df.set_index('date').sort_index()
-            weekly_b_nav = df.resample("W", on="date").last().set_index("date").unit_net_value.dropna()
+            df.index = df['date']
+            weekly_b_nav = df.resample("W").last().set_index("date").unit_net_value.dropna()
+            monthly_b_nav = df.resample("M").last().set_index("date").unit_net_value.dropna()
             weekly_b_returns = (weekly_b_nav / weekly_b_nav.shift(1).fillna(1)).fillna(0) - 1
+            monthly_b_returns = (monthly_b_nav / monthly_b_nav.shift(1).fillna(1)).fillna(0) - 1
             result_dict['benchmark_portfolio'] = benchmark_portfolios
+            # 超额收益最长回撤持续期
+            ex_returns = total_portfolios.unit_net_value / benchmark_portfolios.unit_net_value - 1
+            max_ddd = _max_ddd(ex_returns + 1, total_portfolios.index)
+            result_dict["summary"]["excess_max_drawdown_duration"] = max_ddd
+            result_dict["summary"]["excess_max_drawdown_duration_start_date"] = str(max_ddd.start_date)
+            result_dict["summary"]["excess_max_drawdown_duration_end_date"] = str(max_ddd.end_date)
+            result_dict["summary"]["excess_max_drawdown_duration_days"] = (max_ddd.end_date - max_ddd.start_date).days
         else:
             weekly_b_returns = pandas.Series(index=weekly_returns.index)
+            monthly_b_returns = pandas.Series(index=monthly_returns.index)
+
+        # 周度风险指标
         weekly_risk = Risk(weekly_returns, weekly_b_returns, risk_free_rate, WEEKLY)
         summary.update({
             "weekly_alpha": weekly_risk.alpha,
             "weekly_beta": weekly_risk.beta,
             "weekly_sharpe": weekly_risk.sharpe,
             "weekly_sortino": weekly_risk.sortino,
-            'weekly_information_ratio': weekly_risk.information_ratio,
-            "weekly_tracking_error": weekly_risk.tracking_error,
+            "weekly_information_ratio": weekly_risk.information_ratio,
+            "weekly_tracking_error": weekly_risk.annual_tracking_error,
             "weekly_max_drawdown": weekly_risk.max_drawdown,
+            "weekly_win_rate": weekly_risk.win_rate,
+            "weekly_volatility": weekly_risk.annual_volatility,
+            "weekly_ulcer_index": weekly_risk.ulcer_index,
+            "weekly_ulcer_performance_index": weekly_risk.ulcer_performance_index,
         })
+
+        # 月度风险指标
+        monthly_risk = Risk(monthly_returns, monthly_b_returns, risk_free_rate, MONTHLY)
+        summary.update({
+            "monthly_sharpe": monthly_risk.sharpe,
+            "monthly_volatility": monthly_risk.annual_volatility,
+            "monthly_excess_win_rate": monthly_risk.excess_win_rate,
+        })
+
+        if self._benchmark:
+            summary.update({
+                "weekly_excess_ulcer_index": weekly_risk.excess_ulcer_index,
+                "weekly_excess_ulcer_performance_index": weekly_risk.excess_ulcer_performance_index,
+            })
 
         plots = self._plot_store.get_plots()
         if plots:
@@ -434,12 +499,15 @@ class AnalyserMod(AbstractMod):
             from .report import generate_report
             generate_report(result_dict, self._mod_config.report_save_path)
 
-        if self._mod_config.plot or self._mod_config.plot_save_file:
+        _plot = True if self._mod_config.plot else False
+
+        if _plot or self._mod_config.plot_save_file:
             from .plot import plot_result
             plot_config = self._mod_config.plot_config
+            _plot_template_cls = PLOT_TEMPLATE.get(self._mod_config.plot, DefaultPlot)
             plot_result(
                 result_dict, self._mod_config.plot, self._mod_config.plot_save_file,
-                plot_config.weekly_indicators, plot_config.open_close_points
+                plot_config.weekly_indicators, plot_config.open_close_points, _plot_template_cls
             )
 
         return result_dict

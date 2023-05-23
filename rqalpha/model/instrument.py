@@ -21,6 +21,7 @@ import datetime
 from typing import Dict, Callable, Optional
 
 import numpy as np
+from dateutil.parser import parse
 
 from rqalpha.environment import Environment
 from rqalpha.const import INSTRUMENT_TYPE, POSITION_DIRECTION, DEFAULT_ACCOUNT_TYPE, EXCHANGE
@@ -32,13 +33,16 @@ class Instrument(metaclass=PropertyReprMeta):
     DEFAULT_DE_LISTED_DATE = datetime.datetime(2999, 12, 31)
 
     @staticmethod
-    def _fix_date(ds, dflt=None):
+    def _fix_date(ds, dflt=None) -> datetime:
         if isinstance(ds, datetime.datetime):
             return ds
-        if ds == '0000-00-00':
+        if ds == '0000-00-00' or ds is None:
             return dflt
-        year, month, day = ds.split('-')
-        return datetime.datetime(int(year), int(month), int(day))
+        try:
+            year, month, day = ds.split('-')
+            return datetime.datetime(int(year), int(month), int(day))
+        except:
+            return parse(ds)
 
     __repr__ = property_repr
 
@@ -418,7 +422,7 @@ class Instrument(metaclass=PropertyReprMeta):
         return ipo_days if ipo_days >= 0 else -1
 
     def days_to_expire(self):
-        if self.type != 'Future' or self.order_book_id[-2:] == '88' or self.order_book_id[-2:] == '99':
+        if self.type != 'Future' or self.is_future_continuous_contract(self.order_book_id):
             return -1
 
         date = Environment.get_instance().trading_dt.date()
@@ -446,11 +450,12 @@ class Instrument(metaclass=PropertyReprMeta):
         else:
             raise NotImplementedError
 
-    FUTURE_CONTINUOUS_CONTRACT = re.compile("^[A-Z]+(88|888|99|889)$")
+    FUTURE_CONTINUOUS_CONTRACT = re.compile(r"^[A-Z]+(88|888|99|889)([A-Z]\d+)?$")
 
     @classmethod
     def is_future_continuous_contract(cls, order_book_id):
         return re.match(cls.FUTURE_CONTINUOUS_CONTRACT, order_book_id)
+
 
 class SectorCodeItem(object):
     def __init__(self, cn, en, name):

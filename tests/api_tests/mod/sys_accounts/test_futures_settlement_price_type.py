@@ -12,44 +12,44 @@
 #         在此前提下，对本软件的使用同样需要遵守 Apache 2.0 许可，Apache 2.0 许可与本许可冲突之处，以本许可为准。
 #         详细的授权流程，请联系 public@ricequant.com 获取。
 
-YIELD_CURVE_TENORS = {
-    0: '0S',
-    30: '1M',
-    60: '2M',
-    90: '3M',
-    180: '6M',
-    270: '9M',
-    365: '1Y',
-    365 * 2: '2Y',
-    365 * 3: '3Y',
-    365 * 4: '4Y',
-    365 * 5: '5Y',
-    365 * 6: '6Y',
-    365 * 7: '7Y',
-    365 * 8: '8Y',
-    365 * 9: '9Y',
-    365 * 10: '10Y',
-    365 * 15: '15Y',
-    365 * 20: '20Y',
-    365 * 30: '30Y',
-    365 * 40: '40Y',
-    365 * 50: '50Y',
+from rqalpha.apis import *
+
+__config__ = {
+    "base": {
+        "start_date": "2016-01-01",
+        "end_date": "2016-01-31",
+        "frequency": "1d",
+        "accounts": {
+            "future": 1000000,
+        }
+    },
+    "mod": {
+        "sys_accounts": {
+            "futures_settlement_price_type": "settlement"
+        }
+    }
 }
 
-YIELD_CURVE_DURATION = sorted(YIELD_CURVE_TENORS.keys())
 
+def test_futures_settlement_price_type():
 
-def get_tenor_for(start_date, end_date):
-    duration = (end_date - start_date).days
-    tenor = 0
-    for t in YIELD_CURVE_DURATION:
-        if duration >= t:
-            tenor = t
-        else:
-            break
+    def init(context):
+        context.fixed = True
+        context.symbol = "IC1603"
+        context.total = 0
 
-    return YIELD_CURVE_TENORS[tenor]
+    def handle_bar(context, bar_dict):
+        if context.fixed:
+            buy_open(context.symbol, 1)
+            context.fixed = False
+        context.total += 1
 
+    def after_trading(context):
+        pos = get_position(context.symbol)
+        # close - prev_settlement
+        if context.total == 2:
+            assert pos.position_pnl == (6364.6 - 6657.0) * 200
+        elif context.total == 3:
+            assert pos.position_pnl == (6468 - 6351.2) * 200
+    return locals()
 
-def get_tenors_for(start_date, end_date):
-    return [YIELD_CURVE_TENORS[t] for t in YIELD_CURVE_DURATION if (end_date - start_date).days >= t]

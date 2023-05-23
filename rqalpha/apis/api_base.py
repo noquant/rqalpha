@@ -246,9 +246,13 @@ def subscribe(id_or_symbols):
     # type: (Union[str, Instrument, Iterable[str], Iterable[Instrument]]) -> None
 
     """
-    订阅合约行情。该操作会导致合约池内合约的增加，从而影响handle_bar中处理bar数据的数量。
+    订阅合约行情。
 
-    需要注意，用户在初次编写策略时候需要首先订阅合约行情，否则handle_bar不会被触发。
+    在日级别回测中不需要订阅合约。
+
+    在分钟回测中，若策略只设置了股票账户则不需要订阅合约；若设置了期货账户，则需要订阅策略关注的期货合约，框架会根据订阅的期货合约品种触发对应交易时间的 handle_bar。为了方便起见，也可以以直接订阅主力连续合约。
+
+    在 tick 回测中，策略需要订阅每一个关注的股票/期货合约，框架会根据订阅池触发对应标的的 handle_tick。
 
     :param id_or_symbols: 标的物
 
@@ -509,7 +513,7 @@ def history_bars(
 def history_ticks(order_book_id, count):
     # type: (str, int) -> List[TickObject]
     """
-    获取指定合约历史 tick 对象，仅支持在 tick 级别的策略（回测、模拟交易、实盘）中调用
+    获取指定合约历史（不晚于当前时间的）tick 对象，仅支持在 tick 级别的策略（回测、模拟交易、实盘）中调用。
 
     :param order_book_id: 合约代码
     :param count: 获取的 tick 数量
@@ -861,17 +865,17 @@ def symbol(order_book_id, sep=", "):
     EXECUTION_PHASE.SCHEDULED,
     EXECUTION_PHASE.GLOBAL
 )
-def deposit(account_type, amount):
-    # type: (str, float) -> None
+def deposit(account_type: str, amount: float, receiving_days: int = 0):
     """
     入金（增加账户资金）
 
     :param account_type: 账户类型
-    :param amount: 增加金额
+    :param amount: 入金金额
+    :param receiving_days: 入金到账天数，0 表示立刻到账，1 表示资金在下一个交易日盘前到账
     :return: None
     """
     env = Environment.get_instance()
-    return env.portfolio.deposit_withdraw(account_type, amount)
+    return env.portfolio.deposit_withdraw(account_type, amount, receiving_days)
 
 
 @export_as_api
@@ -897,3 +901,52 @@ def withdraw(account_type, amount):
     """
     env = Environment.get_instance()
     return env.portfolio.deposit_withdraw(account_type, amount * -1)
+
+
+@export_as_api
+@ExecutionContext.enforce_phase(
+    EXECUTION_PHASE.OPEN_AUCTION,
+    EXECUTION_PHASE.ON_BAR,
+    EXECUTION_PHASE.ON_TICK,
+    EXECUTION_PHASE.SCHEDULED,
+    EXECUTION_PHASE.GLOBAL
+)
+@apply_rules(
+    verify_that("account_type").is_in(DEFAULT_ACCOUNT_TYPE),
+    verify_that("amount", pre_check=True).is_instance_of((int, float)).is_greater_than(0),
+)
+def finance(amount, account_type=DEFAULT_ACCOUNT_TYPE.STOCK):
+    """
+    融资
+
+    :param amount: 融资金额
+    :param account_type: 融资账户
+    :return: None
+    """
+    env = Environment.get_instance()
+    return env.portfolio.finance_repay(amount, account_type)
+
+
+@export_as_api
+@ExecutionContext.enforce_phase(
+    EXECUTION_PHASE.OPEN_AUCTION,
+    EXECUTION_PHASE.ON_BAR,
+    EXECUTION_PHASE.ON_TICK,
+    EXECUTION_PHASE.SCHEDULED,
+)
+@apply_rules(
+    verify_that("account_type").is_in(DEFAULT_ACCOUNT_TYPE),
+    verify_that("amount", pre_check=True).is_instance_of((int, float)).is_greater_than(0),
+)
+def repay(amount, account_type=DEFAULT_ACCOUNT_TYPE.STOCK):
+    """
+    还款
+
+    :param amount: 还款金额
+    :param account_type: 还款账户
+    :return: None
+    """
+    env = Environment.get_instance()
+    return env.portfolio.finance_repay(amount * -1, account_type)
+
+

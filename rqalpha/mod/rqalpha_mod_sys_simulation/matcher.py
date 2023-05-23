@@ -34,7 +34,7 @@ class AbstractMatcher:
         # type: (Account, Order, bool) -> None
         raise NotImplementedError
 
-    def update(self):
+    def update(self, event):
         raise NotImplementedError
 
 
@@ -205,7 +205,7 @@ class DefaultBarMatcher(AbstractMatcher):
             )
             order.mark_cancelled(reason)
 
-    def update(self):
+    def update(self, event):
         self._turnover.clear()
 
 
@@ -231,7 +231,6 @@ class DefaultTickMatcher(AbstractMatcher):
         self._cur_tick: Dict[str, TickObject] = dict()
 
         # 订阅一些事件
-        self._env.event_bus.prepend_listener(EVENT.TICK, self._on_tick)
         self._env.event_bus.add_listener(EVENT.BEFORE_TRADING, self._on_before_trading)
 
     def _create_deal_price_decider(self, matching_type):
@@ -259,12 +258,6 @@ class DefaultTickMatcher(AbstractMatcher):
         # 在每个交易日的盘前删除前一个交易日的数据
         self._last_tick.clear()
         self._cur_tick.clear()
-
-    def _on_tick(self, event):
-        # 保存上一个时刻的tick
-        self._last_tick[event.tick.order_book_id] = self._cur_tick.get(event.tick.order_book_id)
-        # 保存当前时刻的tick
-        self._cur_tick[event.tick.order_book_id] = event.tick
 
     def _get_today_history_ticks(self, order_book_id, count):
         """ 获取当前交易日的历史tick数据 """
@@ -326,6 +319,7 @@ class DefaultTickMatcher(AbstractMatcher):
                     listed_date=listed_date,
                 )
             else:
+                # TODO：这里报错信息比较模糊，可以根据撮合类型给出更明确的提示，比如是否是熔断了，是否是涨跌停了
                 reason = _(u"Order Cancelled: current tick [{order_book_id}] miss market data.").format(
                     order_book_id=order.order_book_id)
             order.mark_rejected(reason)
@@ -399,7 +393,7 @@ class DefaultTickMatcher(AbstractMatcher):
 
             if volume_limit <= 0:
                 # 集合竞价无法撤单
-                if order.type == ORDER_TYPE.MARKET and not instrument.during_call_auction(self._env.calendar_dt):
+                if order.type == ORDER_TYPE.MARKET:
                     reason = _(u"Order Cancelled: market order {order_book_id} volume {order_volume}"
                                u" due to volume limit").format(
                         order_book_id=order.order_book_id,
@@ -456,7 +450,9 @@ class DefaultTickMatcher(AbstractMatcher):
             )
             order.mark_cancelled(reason)
 
-    def update(self):
+    def update(self, event):
+        self._last_tick[event.tick.order_book_id] = self._cur_tick.get(event.tick.order_book_id)
+        self._cur_tick[event.tick.order_book_id] = event.tick
         self._turnover.clear()
 
 
@@ -547,7 +543,7 @@ class CounterPartyOfferMatcher(DefaultTickMatcher):
 
             if volume_limit <= 0:
                 # 集合竞价无法撤单
-                if order.type == ORDER_TYPE.MARKET and not instrument.during_call_auction(self._env.calendar_dt):
+                if order.type == ORDER_TYPE.MARKET:
                     reason = _(u"Order Cancelled: market order {order_book_id} volume {order_volume}"
                                u" due to volume limit").format(
                         order_book_id=order.order_book_id,
